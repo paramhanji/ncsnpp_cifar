@@ -398,8 +398,3 @@ class ResnetBlockBigGANpp(nn.Module):
       return x + h
     else:
       return (x + h) / np.sqrt(2.)
-
-
-m = NCSNpp()
-o = m(torch.randn(32, 3, 32, 32), torch.rand(32))
-print(o.shape)
