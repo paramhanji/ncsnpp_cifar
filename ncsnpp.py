@@ -1,5 +1,4 @@
 import functools
-import math
 import numpy as np
 import string
 import torch
@@ -8,6 +7,17 @@ import torch.nn.functional as F
 
 from . import up_or_down_sampling
 
+
+class GaussianFourierProjection(nn.Module):
+  """Gaussian Fourier embeddings for noise levels."""
+
+  def __init__(self, embedding_size=256, scale=1.0):
+    super().__init__()
+    self.W = nn.Parameter(torch.randn(embedding_size) * scale, requires_grad=False)
+
+  def forward(self, x):
+    x_proj = x[:, None] * self.W[None, :] * 2 * np.pi
+    return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 def conv3x3(in_planes, out_planes, stride=1, bias=True, dilation=1, init_scale=1., padding=1):
   """3x3 convolution with DDPM initialization."""
@@ -23,22 +33,6 @@ def conv1x1(in_planes, out_planes, stride=1, bias=True, init_scale=1., padding=0
   conv.weight.data = variance_scaling(init_scale)(conv.weight.data.shape)
   nn.init.zeros_(conv.bias)
   return conv
-
-def get_timestep_embedding(timesteps, embedding_dim, max_positions=10000):
-  assert len(timesteps.shape) == 1  # and timesteps.dtype == tf.int32
-  half_dim = embedding_dim // 2
-  # magic number 10000 is from transformers
-  emb = math.log(max_positions) / (half_dim - 1)
-  # emb = math.log(2.) / (half_dim - 1)
-  emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -emb)
-  # emb = tf.range(num_embeddings, dtype=jnp.float32)[:, None] * emb[None, :]
-  # emb = tf.cast(timesteps, dtype=jnp.float32)[:, None] * emb[None, :]
-  emb = timesteps.float()[:, None] * emb[None, :]
-  emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-  if embedding_dim % 2 == 1:  # zero pad
-    emb = F.pad(emb, (0, 1), mode='constant')
-  assert emb.shape == (timesteps.shape[0], embedding_dim)
-  return emb
 
 def variance_scaling(scale=1.,
                      in_axis=1, out_axis=0,
@@ -63,14 +57,14 @@ def variance_scaling(scale=1.,
 class NCSNpp(nn.Module):
   """NCSN++ model"""
 
-  def __init__(self, sigma_max=50, sigma_min=0.01, num_scales=1000, nf=128, ch_mult=(1, 2, 2, 2), num_res_blocks=4,
-               attn_resolutions=(16,), image_size=32, dropout=0.1, conditional=True, fir_kernel=[1, 3, 3, 1],
-               init_scale=0, channels=3):
+  def __init__(self, sigmas, nf=128, ch_mult=(1, 2, 2, 2), num_res_blocks=4,
+               attn_resolutions=(16,), image_size=32, dropout=0.1, fir_kernel=[1, 3, 3, 1],
+               init_scale=0, channels=3, fourier_scale=16):
     super().__init__()
     self.act = act = nn.SiLU()
-    # TODO
-    sigmas = np.exp(np.linspace(np.log(sigma_max), np.log(sigma_min), num_scales))
-    self.register_buffer('sigmas', torch.tensor(sigmas))
+    if not isinstance(sigmas, torch.Tensor):
+      sigmas = torch.tensor(sigmas)
+    self.register_buffer('sigmas', sigmas)
 
     self.nf = nf
     self.num_res_blocks = num_res_blocks
@@ -78,18 +72,12 @@ class NCSNpp(nn.Module):
     self.num_resolutions = num_resolutions = len(ch_mult)
     all_resolutions = [image_size // (2 ** i) for i in range(num_resolutions)]
 
-    self.conditional = conditional  # noise-conditional
     fir = fir_kernel is not None
 
     modules = []
-
-    if conditional:
-      modules.append(nn.Linear(nf, nf * 4))
-      modules[-1].weight.data = variance_scaling()(modules[-1].weight.shape)
-      nn.init.zeros_(modules[-1].bias)
-      modules.append(nn.Linear(nf * 4, nf * 4))
-      modules[-1].weight.data = variance_scaling()(modules[-1].weight.shape)
-      nn.init.zeros_(modules[-1].bias)
+    modules.append(GaussianFourierProjection(
+      embedding_size=nf, scale=fourier_scale
+    ))
 
     AttnBlock = functools.partial(AttnBlockpp,
                                   init_scale=init_scale,
@@ -117,7 +105,7 @@ class NCSNpp(nn.Module):
     in_ch = nf
     for i_level in range(num_resolutions):
       # Residual blocks for this resolution
-      for i_block in range(num_res_blocks):
+      for _ in range(num_res_blocks):
         out_ch = nf * ch_mult[i_level]
         modules.append(ResnetBlock(in_ch=in_ch, out_ch=out_ch))
         in_ch = out_ch
@@ -139,7 +127,6 @@ class NCSNpp(nn.Module):
     modules.append(AttnBlock(channels=in_ch))
     modules.append(ResnetBlock(in_ch=in_ch))
 
-    pyramid_ch = 0
     # Upsampling block
     for i_level in reversed(range(num_resolutions)):
       for i_block in range(num_res_blocks + 1):
@@ -166,18 +153,13 @@ class NCSNpp(nn.Module):
     # timestep/noise_level embedding; only for continuous training
     modules = self.all_modules
     m_idx = 0
-    # Sinusoidal positional embeddings.
-    timesteps = time_cond
-    used_sigmas = self.sigmas[time_cond.long()]
-    temb = get_timestep_embedding(timesteps, self.nf)
 
-    if self.conditional:
-      temb = modules[m_idx](temb)
-      m_idx += 1
-      temb = modules[m_idx](self.act(temb))
-      m_idx += 1
-    else:
-      temb = None
+    # Gaussian Fourier features embeddings.
+    used_sigmas = time_cond
+    temb = modules[m_idx](torch.log(used_sigmas))
+    m_idx += 1
+
+    temb = None
 
     # Downsampling block
     input_pyramid = x
@@ -214,8 +196,6 @@ class NCSNpp(nn.Module):
     h = modules[m_idx](h, temb)
     m_idx += 1
 
-    pyramid = None
-
     # Upsampling block
     for i_level in reversed(range(self.num_resolutions)):
       for i_block in range(self.num_res_blocks + 1):
@@ -238,6 +218,8 @@ class NCSNpp(nn.Module):
     m_idx += 1
 
     assert m_idx == len(modules)
+    used_sigmas = used_sigmas.reshape((x.shape[0], *([1] * len(x.shape[1:]))))
+    h = h / used_sigmas
 
     return h
 
