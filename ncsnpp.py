@@ -73,6 +73,8 @@ class NCSNpp(nn.Module):
     all_resolutions = [image_size // (2 ** i) for i in range(num_resolutions)]
 
     fir = fir_kernel is not None
+    if fir:
+      assert up_or_down_sampling.fir_built, 'Unable to build "fused resampling"; use native resampling by passing "fir_kernel=None"'
 
     modules = []
     modules.append(GaussianFourierProjection(

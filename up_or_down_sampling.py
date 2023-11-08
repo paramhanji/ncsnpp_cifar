@@ -7,7 +7,12 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 import numpy as np
-from .op import upfirdn2d
+
+fir_built = True
+try:
+  from .op import upfirdn2d
+except ImportError:
+    fir_built = False
 
 
 # Function ported from StyleGAN2
