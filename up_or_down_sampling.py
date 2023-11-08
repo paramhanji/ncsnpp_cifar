@@ -11,7 +11,7 @@ import numpy as np
 fir_built = True
 try:
   from .op import upfirdn2d
-except ImportError:
+except (ImportError, RuntimeError):
     fir_built = False
 
 
